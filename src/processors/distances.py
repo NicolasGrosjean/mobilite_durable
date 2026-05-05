@@ -37,6 +37,7 @@ class DistancesProcessor(ProcessorMixin):
     input_dir = DATA_FOLDER / "distances"
     output_dir = input_dir
     output_file = output_dir / "bus_stops_to_activities_distances.parquet"
+    part_file_prefix = "bus_stops_to_activities_distances_latitude_index_"
 
     # API declaration
     api_class: type[OpenRouteServiceAPI] = OpenRouteServiceAPI
@@ -65,111 +66,119 @@ class DistancesProcessor(ProcessorMixin):
         """Fetch data from API, in this case compute distances between bus stops and activities.
 
         Variables in kwargs:
-        - keep_old_distances (bool): if True, keep old distances from the existing output file and only compute new distances for new bus stop - activity pairs. If false, computed all the bus stop - activity pairs.
+        - compute_non_computed_distances_only (bool): if True, only compute distances that are not already computed in the existing output file (bus and activity files are not read). If False, compute all distances and optionally keep old distances if keep_old_distances is True.
+        - keep_old_distances (bool): if True and compute_non_computed_distances_only is False, keep old distances from the existing output file and only compute new distances for new bus stop - activity pairs. If false, computed all the bus stop - activity pairs. Ignored if compute_non_computed_distances_only is True.
         - latitude_grouping_precision (float): the precision for grouping activities by latitude. Latitude values are cut to this precision to group actitvities in the same groupes at each running. Creating groups reduce memory usage.
         """
+        compute_non_computed_distances_only = kwargs.pop(
+            "compute_non_computed_distances_only", False
+        )
         keep_old_distances = kwargs.pop("keep_old_distances", False)
         latitude_grouping_precision = kwargs.pop("latitude_grouping_precision", 0.1)
-        return cls._fetch_from_api(keep_old_distances, latitude_grouping_precision)
+        return cls._fetch_from_api(
+            compute_non_computed_distances_only, keep_old_distances, latitude_grouping_precision
+        )
 
     @classmethod
     def _fetch_from_api(
         cls,
+        compute_non_computed_distances_only: bool,
         keep_old_distances: bool,
         latitude_grouping_precision: float,
     ) -> pd.DataFrame:
-        # Load department limits to filter data in the area of interest
-        area_gdf = gpd.read_file(
-            DATA_FOLDER / "transportdatagouv/contour-des-departements.geojson"
-        )
-
-        # Get bus stops and activities in the area
-        area_bus_stops_gdf = cls._get_bus_stops(area_gdf).rename(
-            columns={"geometry": "bus_stop_geometry"}
-        )
-        logger.info(
-            f"Number of bus stops in the {len(cls.area_codes)} areas: {len(area_bus_stops_gdf)}"
-        )
-        area_activity_gdf = cls._get_area_activities(
-            area_gdf, latitude_grouping_precision
-        ).rename(columns={"geometry": "activity_geometry"})
-        logger.info(
-            f"Number of activities in the {len(cls.area_codes)} areas: {len(area_activity_gdf)}"
-        )
-
-        # Compute cross product of bus stops and activities for a group of actitivities
-        for activity_latitude_index in area_activity_gdf["latitude_index"].unique():
-            logger.info(f"Processing activity latitude index {activity_latitude_index}...")
-            activity_subset_gdf = area_activity_gdf[
-                area_activity_gdf["latitude_index"] == activity_latitude_index
-            ]
-            cross_df = area_bus_stops_gdf.reset_index(drop=True).merge(
-                activity_subset_gdf.reset_index(drop=True),
-                how="cross",
-            )
-            logger.info(
-                f"Number of bus stop - activity pairs to compute distances for: {len(cross_df)}"
-            )
-
-            # Merge with old distances to avoid recomputing them
-            part_path = cls._get_distance_part_path(activity_latitude_index)
-            if keep_old_distances and part_path is not None and part_path.exists():
-                logger.info(f"Loading old distances from {part_path} to avoid recomputation...")
-                old_distances_df = cls.fetch_from_file(part_path)
-                if "computed" not in old_distances_df.columns:
-                    old_distances_df["computed"] = ~pd.isna(old_distances_df["distance_m"])
-                cross_df = cross_df.merge(
-                    old_distances_df,
-                    on=cls.bus_stop_columns + ["Id wp"],
-                    how="left",
-                    suffixes=("", "_old"),
-                )
-                cross_df["computed"] = cross_df["computed"].fillna(False).astype(bool)
+        part_paths: list[Path] = []
+        if compute_non_computed_distances_only:
+            logger.info("Computing only non-computed distances using existing part files...")
+            for part_path in cls.output_dir.glob(f"{cls.part_file_prefix}*.parquet"):
+                part_paths.append(part_path)
+                logger.info(f"Processing part file {part_path}...")
+                part_cross_df = cls.fetch_from_file(part_path)
                 logger.info(
-                    f"Number of already computed distances: {cross_df['computed'].sum()}"
+                    f"Number of already computed distances: {part_cross_df['computed'].sum()}"
                 )
-                logger.info(f"Number of distances to compute: {(~cross_df['computed']).sum()}")
-            else:
-                cross_df["computed"] = False
+                logger.info(
+                    f"Number of distances to compute: {(~part_cross_df['computed']).sum()}"
+                )
+                if not part_cross_df["computed"].all():
+                    cls._fill_cross_df(part_cross_df)
+                    cls.save(part_cross_df, part_path)
+                    logger.info(f"Saved updated distances to {part_path}")
+                else:
+                    logger.info("All distances in this part are already computed, skipping...")
+        else:
+            # Load department limits to filter data in the area of interest
+            area_gdf = gpd.read_file(
+                DATA_FOLDER / "transportdatagouv/contour-des-departements.geojson"
+            )
 
-            # Calculate distances using the API
-            with concurrent.futures.ThreadPoolExecutor(max_workers=cls.max_workers) as executor:
-                non_computed_indices = list(cross_df.index[~cross_df["computed"]])
-
-                for batch_id in tqdm(
-                    range(0, len(non_computed_indices), cls.batch_size),
-                    total=(len(non_computed_indices) + cls.batch_size - 1) // cls.batch_size,
-                    desc="Submitting distance computations",
-                ):
-                    batch_indices = non_computed_indices[batch_id : batch_id + cls.batch_size]
-                    futures = {
-                        executor.submit(
-                            cls._compute_distance_and_manage_errors, cross_df.loc[i]
-                        ): i
-                        for i in batch_indices
-                    }
-                    for future in concurrent.futures.as_completed(futures):
-                        i = futures[future]
-                        (
-                            cross_df.at[i, "distance_m"],
-                            cross_df.at[i, "computed"],
-                        ) = future.result()
-            cls.save(
-                cross_df.loc[:, cls.bus_stop_columns + ["Id wp", "distance_m", "computed"]],
-                part_path,
+            # Get bus stops and activities in the area
+            area_bus_stops_gdf = cls._get_bus_stops(area_gdf).rename(
+                columns={"geometry": "bus_stop_geometry"}
             )
             logger.info(
-                f"Saved distances for activity latitude index {activity_latitude_index} to {part_path}"
+                f"Number of bus stops in the {len(cls.area_codes)} areas: {len(area_bus_stops_gdf)}"
+            )
+            area_activity_gdf = cls._get_area_activities(
+                area_gdf, latitude_grouping_precision
+            ).rename(columns={"geometry": "activity_geometry"})
+            logger.info(
+                f"Number of activities in the {len(cls.area_codes)} areas: {len(area_activity_gdf)}"
             )
 
-        # Merge the different parts and keep only computed distances
-        distance_parts = []
-        for activity_latitude_index in area_activity_gdf["latitude_index"].unique():
-            part_path = cls._get_distance_part_path(activity_latitude_index)
-            if part_path.exists():
-                distance_df = cls.fetch_from_file(part_path)
-                distance_parts.append(distance_df[distance_df["computed"]])
-        return pd.concat(distance_parts, ignore_index=True)
+            # Compute cross product of bus stops and activities for a group of actitivities
+            for activity_latitude_index in area_activity_gdf["latitude_index"].unique():
+                logger.info(f"Processing activity latitude index {activity_latitude_index}...")
+                activity_subset_gdf = area_activity_gdf[
+                    area_activity_gdf["latitude_index"] == activity_latitude_index
+                ]
+                part_cross_df = area_bus_stops_gdf.reset_index(drop=True).merge(
+                    activity_subset_gdf.reset_index(drop=True),
+                    how="cross",
+                )
+                logger.info(
+                    f"Number of bus stop - activity pairs to compute distances for: {len(part_cross_df)}"
+                )
+
+                # Merge with old distances to avoid recomputing them
+                part_path = cls._get_distance_part_path(activity_latitude_index)
+                part_paths.append(part_path)
+                if keep_old_distances and part_path is not None and part_path.exists():
+                    logger.info(
+                        f"Loading old distances from {part_path} to avoid recomputation..."
+                    )
+                    old_distances_df = cls.fetch_from_file(part_path)
+                    if "computed" not in old_distances_df.columns:
+                        old_distances_df["computed"] = ~pd.isna(old_distances_df["distance_m"])
+                    part_cross_df = part_cross_df.merge(
+                        old_distances_df,
+                        on=cls.bus_stop_columns + ["Id wp"],
+                        how="left",
+                        suffixes=("", "_old"),
+                    )
+                    part_cross_df["computed"] = (
+                        part_cross_df["computed"].fillna(False).astype(bool)
+                    )
+                    logger.info(
+                        f"Number of already computed distances: {part_cross_df['computed'].sum()}"
+                    )
+                    logger.info(
+                        f"Number of distances to compute: {(~part_cross_df['computed']).sum()}"
+                    )
+                else:
+                    part_cross_df["computed"] = False
+
+                # Calculate distances using the API
+                cls._fill_cross_df(part_cross_df)
+                cls.save(
+                    part_cross_df.loc[
+                        :, cls.bus_stop_columns + ["Id wp", "distance_m", "computed"]
+                    ],
+                    part_path,
+                )
+                logger.info(
+                    f"Saved distances for activity latitude index {activity_latitude_index} to {part_path}"
+                )
+        return cls._merge_parts_and_filter_computed(part_paths)
 
     @classmethod
     def fetch_from_file(cls, path: Path, **kwargs):
@@ -274,10 +283,39 @@ class DistancesProcessor(ProcessorMixin):
 
     @classmethod
     def _get_distance_part_path(cls, activity_latitude_index: int) -> Path:
-        return (
-            cls.output_dir
-            / f"bus_stops_to_activities_distances_latitude_index_{activity_latitude_index}.parquet"
-        )
+        return cls.output_dir / f"{cls.part_file_prefix}{activity_latitude_index}.parquet"
+
+    @classmethod
+    def _fill_cross_df(cls, cross_df: pd.DataFrame) -> None:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=cls.max_workers) as executor:
+            non_computed_indices = list(cross_df.index[~cross_df["computed"]])
+
+            for batch_id in tqdm(
+                range(0, len(non_computed_indices), cls.batch_size),
+                total=(len(non_computed_indices) + cls.batch_size - 1) // cls.batch_size,
+                desc="Submitting distance computations",
+            ):
+                batch_indices = non_computed_indices[batch_id : batch_id + cls.batch_size]
+                futures = {
+                    executor.submit(cls._compute_distance_and_manage_errors, cross_df.loc[i]): i
+                    for i in batch_indices
+                }
+                for future in concurrent.futures.as_completed(futures):
+                    i = futures[future]
+                    (
+                        cross_df.at[i, "distance_m"],
+                        cross_df.at[i, "computed"],
+                    ) = future.result()
+
+    @classmethod
+    def _merge_parts_and_filter_computed(cls, part_paths: list[Path]) -> pd.DataFrame:
+        distance_parts = []
+        for part_path in part_paths:
+            if part_path.exists():
+                distance_df = cls.fetch_from_file(part_path)
+                # TODO Remove computed column after filtering on it
+                distance_parts.append(distance_df[distance_df["computed"]])
+        return pd.concat(distance_parts, ignore_index=True)
 
     @classmethod
     def _compute_distance_and_manage_errors(cls, row: pd.Series) -> tuple[float, bool]:
@@ -325,7 +363,10 @@ class DistancesProcessor(ProcessorMixin):
 
 def main(**kwargs):
     logger.info("Computing distances from bus stops to activities...")
-    DistancesProcessor.run(reload_pipeline=True, fetch_api_kwargs={"keep_old_distances": True})
+    # DistancesProcessor.run(reload_pipeline=True, fetch_api_kwargs={"keep_old_distances": True})
+    DistancesProcessor.run(
+        reload_pipeline=True, fetch_api_kwargs={"compute_non_computed_distances_only": True}
+    )
 
 
 if __name__ == "__main__":
