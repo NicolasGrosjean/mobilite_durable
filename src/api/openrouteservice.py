@@ -1,4 +1,9 @@
+import logging
+
 import requests
+
+# Set up logger
+logger = logging.getLogger(__name__)
 
 
 class OpenRouteServiceAPI:
@@ -26,6 +31,13 @@ class OpenRouteServiceAPI:
         }
 
         response = requests.get(base_url, params=params)
+        if response.status_code != 200 and response.reason == "":
+            # Try to fill the reason if request fails and reason is empty
+            try:
+                data = response.json()
+                response.reason = data.get("error", {}).get("message", "")
+            except Exception:
+                logger.debug("Failed to parse error message from response.")
         response.raise_for_status()
 
         data = response.json()
