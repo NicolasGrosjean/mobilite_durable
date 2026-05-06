@@ -12,6 +12,7 @@ from pathlib import Path
 import geopandas as gpd
 import numpy as np
 import pandas as pd
+from shapely import Point
 from tqdm import tqdm
 
 from src.api.openrouteservice import OpenRouteServiceAPI
@@ -182,12 +183,29 @@ class DistancesProcessor(ProcessorMixin):
     def _get_area_activities(
         cls, area_gdf: gpd.GeoDataFrame, latitude_grouping_precision: float
     ) -> gpd.GeoDataFrame:
-        activity_gdf = gpd.read_parquet(DATA_FOLDER / "C2C/depart_topos_stops_isere.parquet")
+        # activity_gdf = gpd.read_parquet(DATA_FOLDER / "C2C/depart_topos_stops_isere.parquet")
+        # activity_gdf = activity_gdf.rename(
+        #     columns={
+        #         "navitia_id": "Id wp",
+        #         "name": "Name wp",
+        #         "nombre_de_depart_de_topo": "nbr_topo",
+        #     }
+        # )
+        access_point_df = pd.read_csv(
+            "src/data/C2C/c2corg-anonymized.2025-12-10.access_points.csv"
+        )
+        activity_gdf = gpd.GeoDataFrame(
+            access_point_df,
+            geometry=[
+                Point(xy)
+                for xy in zip(access_point_df["lon"], access_point_df["lat"], strict=True)
+            ],
+            crs=EPSG_WGS84,
+        )
         activity_gdf = activity_gdf.rename(
             columns={
-                "navitia_id": "Id wp",
-                "name": "Name wp",
-                "nombre_de_depart_de_topo": "nbr_topo",
+                "document_id": "Id wp",
+                "title": "Name wp",
             }
         )
         logger.info(f"Number of activities before filtering by area: {len(activity_gdf)}")
