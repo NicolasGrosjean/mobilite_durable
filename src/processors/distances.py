@@ -88,13 +88,13 @@ class DistancesProcessor(ProcessorMixin):
             columns={"geometry": "bus_stop_geometry"}
         )
         logger.info(
-            f"Number of bus stops in the {len(cls.area_codes)} areas: {len(area_bus_stops_gdf)}"
+            f"Number of bus stops in the {len(cls.area_codes)} areas: {len(area_bus_stops_gdf):,}"
         )
         area_activity_gdf = cls._get_area_activities(
             area_gdf, latitude_grouping_precision
         ).rename(columns={"geometry": "activity_geometry"})
         logger.info(
-            f"Number of activities in the {len(cls.area_codes)} areas: {len(area_activity_gdf)}"
+            f"Number of activities in the {len(cls.area_codes)} areas: {len(area_activity_gdf):,}"
         )
 
         # Compute cross product of bus stops and activities for a group of actitivities
@@ -108,7 +108,7 @@ class DistancesProcessor(ProcessorMixin):
                 how="cross",
             )
             logger.info(
-                f"Number of bus stop - activity pairs to compute distances for: {len(cross_df)}"
+                f"Number of bus stop - activity pairs to compute distances for: {len(cross_df):,}"
             )
 
             # Merge with old distances to avoid recomputing them
@@ -126,9 +126,11 @@ class DistancesProcessor(ProcessorMixin):
                 )
                 cross_df["computed"] = cross_df["computed"].fillna(False).astype(bool)
                 logger.info(
-                    f"Number of already computed distances: {cross_df['computed'].sum()}"
+                    f"Number of already computed distances: {cross_df['computed'].sum():,}"
                 )
-                logger.info(f"Number of distances to compute: {(~cross_df['computed']).sum()}")
+                logger.info(
+                    f"Number of distances to compute: {(~cross_df['computed']).sum():,}"
+                )
             else:
                 cross_df["computed"] = False
 
@@ -192,7 +194,7 @@ class DistancesProcessor(ProcessorMixin):
         #     }
         # )
         access_point_df = pd.read_csv(
-            "src/data/C2C/c2corg-anonymized.2025-12-10.access_points.csv"
+            DATA_FOLDER / "C2C/c2corg-anonymized.2025-12-10.access_points.csv"
         )
         activity_gdf = gpd.GeoDataFrame(
             access_point_df,
@@ -208,13 +210,13 @@ class DistancesProcessor(ProcessorMixin):
                 "title": "Name wp",
             }
         )
-        logger.info(f"Number of activities before filtering by area: {len(activity_gdf)}")
+        logger.info(f"Number of activities before filtering by area: {len(activity_gdf):,}")
         valid_ids = gpd.sjoin(
             activity_gdf.to_crs(EPSG_WGS84),
             area_gdf[area_gdf["code"].isin(cls.area_codes)].to_crs(EPSG_WGS84),
         )["Id wp"].drop_duplicates()
         area_activity_gdf = activity_gdf[activity_gdf["Id wp"].isin(valid_ids)]
-        logger.info(f"Number of activities after filtering by area: {len(area_activity_gdf)}")
+        logger.info(f"Number of activities after filtering by area: {len(area_activity_gdf):,}")
         area_activity_gdf["latitude_index"] = (
             activity_gdf["geometry"].y / latitude_grouping_precision
         ).astype(int)
@@ -228,15 +230,15 @@ class DistancesProcessor(ProcessorMixin):
         if osm_stops_gdf is None or osm_stops_gdf.empty:
             err_msg = "No OSM bus stops found, please process AURA OSM bus stops first."
             raise ValueError(err_msg)
-        logger.info(f"Number of OSM bus stops before filtering by area: {len(osm_stops_gdf)}")
+        logger.info(f"Number of OSM bus stops before filtering by area: {len(osm_stops_gdf):,}")
         valid_osm_ids = gpd.sjoin(
             osm_stops_gdf,
             area_gdf[area_gdf["code"].isin(cls.area_codes)].to_crs(EPSG_WGS84),
         )["osm_id"].drop_duplicates()
         osm_stops_gdf = osm_stops_gdf[osm_stops_gdf["osm_id"].isin(valid_osm_ids)]
-        logger.info(f"Number of OSM bus stops after filtering by area: {len(osm_stops_gdf)}")
+        logger.info(f"Number of OSM bus stops after filtering by area: {len(osm_stops_gdf):,}")
         c2c_stops_gdf = C2CBusStopsProcessor.fetch(reload_pipeline=False)[bus_stop_columns]
-        logger.info(f"Number of C2C bus stops before filtering by area: {len(c2c_stops_gdf)}")
+        logger.info(f"Number of C2C bus stops before filtering by area: {len(c2c_stops_gdf):,}")
         if c2c_stops_gdf is None or c2c_stops_gdf.empty:
             err_msg = "No C2C bus stops found, please process C2C bus stops first."
             raise ValueError(err_msg)
@@ -245,7 +247,7 @@ class DistancesProcessor(ProcessorMixin):
             area_gdf[area_gdf["code"].isin(cls.area_codes)].to_crs(EPSG_WGS84),
         )["navitia_id"].drop_duplicates()
         c2c_stops_gdf = c2c_stops_gdf[c2c_stops_gdf["navitia_id"].isin(valid_navitia_ids)]
-        logger.info(f"Number of C2C bus stops after filtering by area: {len(c2c_stops_gdf)}")
+        logger.info(f"Number of C2C bus stops after filtering by area: {len(c2c_stops_gdf):,}")
         tdg_stop_list = []
         for area_code in cls.area_codes:
             tdg_file = DATA_FOLDER / f"transportdatagouv/stops_{area_code}.parquet"
@@ -254,7 +256,7 @@ class DistancesProcessor(ProcessorMixin):
                 raise ValueError(err_msg)
             tdg_stop_list.append(gpd.read_parquet(tdg_file))
         tdg_stops_gdf = pd.concat(tdg_stop_list, ignore_index=True)
-        logger.info(f"Number of TDG bus stops after filtering by area: {len(tdg_stops_gdf)}")
+        logger.info(f"Number of TDG bus stops after filtering by area: {len(tdg_stops_gdf):,}")
         tdg_stops_gdf.columns = [
             "network_gtfs_id",
             "network",
